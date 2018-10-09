@@ -153,6 +153,7 @@ void cudaclaw_flux2_and_update(int mx, int my, int meqn, int mbc,
     } /* b4step2 conditional */
 
 
+    /* --------------------------- Normal solver : X faces ---------------------------- */
     for(thread_index = threadIdx.x; thread_index < num_ifaces; thread_index += blockDim.x)
     {
         ix = thread_index % ifaces_x;
@@ -167,7 +168,6 @@ void cudaclaw_flux2_and_update(int mx, int my, int meqn, int mbc,
                 I_q = I + mq*zs;
                 ql[mq] = qold[I_q - 1];    /* Left  */
                 qr[mq] = qold[I_q];        /* Right */
-                qd[mq] = qold[I_q - ys];   /* Down  */  
             }
 
             for(m = 0; m < maux; m++)
@@ -176,7 +176,6 @@ void cudaclaw_flux2_and_update(int mx, int my, int meqn, int mbc,
                 I_aux = I + m*zs;
                 auxl[m] = aux[I_aux - 1];
                 auxr[m] = aux[I_aux];
-                auxd[m] = aux[I_aux - ys];
             }                        
 
             rpn2(0, meqn, mwaves, maux, ql, qr, auxl, auxr, wave, s, amdq, apdq);
@@ -193,14 +192,11 @@ void cudaclaw_flux2_and_update(int mx, int my, int meqn, int mbc,
                 }
             }
 
-            if (order[0] == 2)
+            for (m = 0; m < meqn*mwaves; m++)
             {
-                for (m = 0; m < meqn*mwaves; m++)
-                {
-                    I_waves = I + m*zs;
-                    waves[I_waves] = wave[m];
-                }                
-            }
+                I_waves = I + m*zs;
+                waves[I_waves] = wave[m];
+            }                
 
             for (mw = 0; mw < mwaves; mw++)
             {
@@ -212,7 +208,105 @@ void cudaclaw_flux2_and_update(int mx, int my, int meqn, int mbc,
                     maxcfl = cfl;
                 }
             } 
+        }
+    }            
 
+    __syncthreads();
+
+    ifaces_x = mx + 1;
+    ifaces_y = my + 1;
+    num_ifaces = ifaces_x*ifaces_y;
+
+    /* Limit waves in the X direction */
+    if (order[0] == 2)
+    {
+        for(thread_index = threadIdx.x; thread_index < num_ifaces; thread_index += blockDim.x)
+        { 
+            ix = thread_index % ifaces_x;
+            iy = thread_index/ifaces_y;
+
+            I = (ix + mbc)*xs + (iy + mbc)*ys;
+
+            if (ix < mx + 1 && iy < my + 1)   /* Is this needed? */
+            {
+                for(mw = 0; mw < mwaves; mw++)
+                {
+                    I_speeds = I + mw*zs;
+                    s[mw] = speeds[I_speeds];
+
+                    for(mq = 0; mq < meqn; mq++)
+                    {
+                        I_waves = I + (mw*meqn + mq)*zs;
+                        wave[mq] = waves[I_waves];
+                    }                        
+
+                    if (mthlim[mw] > 0)
+                    {
+                        wnorm2 = dotl = dotr = 0;
+                        for(mq = 0; mq < meqn; mq++)
+                        {
+                            I_waves = I + (mw*meqn + mq)*zs;
+                            wnorm2 += pow(wave[mq],2);
+                            dotl += wave[mq]*waves[I_waves-1];
+                            dotr += wave[mq]*waves[I_waves+1];
+                        }
+                        if (wnorm2 != 0)
+                        {
+                            r = (s[mw] > 0) ? dotl/wnorm2 : dotr/wnorm2;
+                            wlimitr = cudaclaw_limiter(mthlim[mw],r);  
+                        }
+                        for (mq = 0; mq < meqn; mq++)
+                        {
+                            wave[mq] *= wlimitr;
+                        }
+                    }
+
+ 
+                    for(mq = 0; mq < meqn; mq++)
+                    {
+                        I_q = I + mq*zs;
+                        cqxx = fabs(s[mw])*(1.0 - fabs(s[mw])*dtdx)*wave[mq];
+                        fm[I_q] += 0.5*cqxx;   
+                        fp[I_q] += 0.5*cqxx;                               
+                        if (order[1] > 0)
+                        {
+                            /* Propagate second order corrections 
+                               in transverse dir. */
+                            amdq_trans[I_q] += cqxx;   
+                            apdq_trans[I_q] -= cqxx;      
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for(thread_index = threadIdx.x; thread_index < num_ifaces; thread_index += blockDim.x)
+    {
+        ix = thread_index % ifaces_x;
+        iy = thread_index/ifaces_y;
+
+        I = (iy + mbc-1)*ys + (ix + mbc-1)*xs;
+
+        if (ix < mx + 2*mbc-1 && iy < my + 2*mbc-1)
+        {
+            for(mq = 0; mq < meqn; mq++)
+            {
+                I_q = I + mq*zs;
+                qr[mq] = qold[I_q];        /* Right */
+                qd[mq] = qold[I_q - ys];   /* Down  */  
+            }
+
+            for(m = 0; m < maux; m++)
+            {
+                /* How is this getting set? */
+                I_aux = I + m*zs;
+                auxr[m] = aux[I_aux];
+                auxd[m] = aux[I_aux - ys];
+            }                        
+
+
+            /* ---------------------- Normal solver : Y faces ------------------------- */
             rpn2(1, meqn, mwaves, maux, qd, qr, auxd, auxr, wave, s, bmdq, bpdq);
 
             /* Set value at bottom interface of cell I */
